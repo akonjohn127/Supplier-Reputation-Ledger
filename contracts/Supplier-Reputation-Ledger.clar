@@ -57,6 +57,31 @@
 
 (define-data-var next-transaction-id uint u1)
 
+(define-map supplier-performance
+    { supplier-id: uint }
+    {
+        total-transactions: uint,
+        completed-transactions: uint,
+        disputed-transactions: uint,
+        cancelled-transactions: uint,
+        total-transaction-value: uint,
+        average-completion-time: uint,
+        performance-score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map performance-milestones
+    {
+        supplier-id: uint,
+        milestone-type: (string-ascii 16),
+    }
+    {
+        count: uint,
+        achieved-at: uint,
+    }
+)
+
 (define-map escrow-funds
     { transaction-id: uint }
     { amount: uint }
@@ -251,6 +276,13 @@
             })
         )
 
+        (let ((completion-time (- stacks-block-height (get created-at transaction-data))))
+            (unwrap-panic (update-supplier-performance (get supplier-id transaction-data)
+                (get amount transaction-data) completion-time "completed"
+            ))
+            (unwrap-panic (check-performance-milestones (get supplier-id transaction-data)))
+        )
+
         (map-delete escrow-funds { transaction-id: transaction-id })
         (ok true)
     )
@@ -270,6 +302,12 @@
 
         (map-set transactions { transaction-id: transaction-id }
             (merge transaction-data { status: "disputed" })
+        )
+
+        (let ((dispute-time (- stacks-block-height (get created-at transaction-data))))
+            (unwrap-panic (update-supplier-performance (get supplier-id transaction-data)
+                (get amount transaction-data) dispute-time "disputed"
+            ))
         )
 
         (ok true)
@@ -490,6 +528,12 @@
             })
         )
 
+        (let ((cancellation-time (- stacks-block-height (get created-at transaction-data))))
+            (unwrap-panic (update-supplier-performance (get supplier-id transaction-data)
+                (get amount transaction-data) cancellation-time "cancelled"
+            ))
+        )
+
         (map-delete escrow-funds { transaction-id: transaction-id })
         (ok true)
     )
@@ -525,4 +569,263 @@
 
 (define-read-only (get-supplier-transactions (supplier-id uint))
     (ok true)
+)
+
+(define-private (update-supplier-performance
+        (supplier-id uint)
+        (transaction-amount uint)
+        (completion-time uint)
+        (status (string-ascii 16))
+    )
+    (let (
+            (current-performance (default-to {
+                total-transactions: u0,
+                completed-transactions: u0,
+                disputed-transactions: u0,
+                cancelled-transactions: u0,
+                total-transaction-value: u0,
+                average-completion-time: u0,
+                performance-score: u0,
+                last-updated: u0,
+            }
+                (map-get? supplier-performance { supplier-id: supplier-id })
+            ))
+            (new-total-transactions (+ (get total-transactions current-performance) u1))
+            (new-completed (if (is-eq status "completed")
+                (+ (get completed-transactions current-performance) u1)
+                (get completed-transactions current-performance)
+            ))
+            (new-disputed (if (is-eq status "disputed")
+                (+ (get disputed-transactions current-performance) u1)
+                (get disputed-transactions current-performance)
+            ))
+            (new-cancelled (if (is-eq status "cancelled")
+                (+ (get cancelled-transactions current-performance) u1)
+                (get cancelled-transactions current-performance)
+            ))
+            (new-total-value (+ (get total-transaction-value current-performance)
+                transaction-amount
+            ))
+            (new-avg-time (if (> new-completed u0)
+                (/
+                    (+
+                        (* (get average-completion-time current-performance)
+                            (- new-completed u1)
+                        )
+                        completion-time
+                    )
+                    new-completed
+                )
+                u0
+            ))
+            (completion-rate (if (> new-total-transactions u0)
+                (/ (* new-completed u10000) new-total-transactions)
+                u0
+            ))
+            (dispute-rate (if (> new-total-transactions u0)
+                (/ (* new-disputed u10000) new-total-transactions)
+                u0
+            ))
+            (performance-score (if (and (> completion-rate u0) (<= dispute-rate u500))
+                (- completion-rate (* dispute-rate u2))
+                (/ completion-rate u2)
+            ))
+        )
+        (map-set supplier-performance { supplier-id: supplier-id } {
+            total-transactions: new-total-transactions,
+            completed-transactions: new-completed,
+            disputed-transactions: new-disputed,
+            cancelled-transactions: new-cancelled,
+            total-transaction-value: new-total-value,
+            average-completion-time: new-avg-time,
+            performance-score: performance-score,
+            last-updated: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-performance-milestones (supplier-id uint))
+    (let (
+            (performance-data (unwrap-panic (map-get? supplier-performance { supplier-id: supplier-id })))
+            (completed-count (get completed-transactions performance-data))
+        )
+        (if (and (>= completed-count u10) (is-none (map-get? performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "reliable-10",
+            })))
+            (map-set performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "reliable-10",
+            } {
+                count: completed-count,
+                achieved-at: stacks-block-height,
+            })
+            true
+        )
+        (if (and (>= completed-count u50) (is-none (map-get? performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "trusted-50",
+            })))
+            (map-set performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "trusted-50",
+            } {
+                count: completed-count,
+                achieved-at: stacks-block-height,
+            })
+            true
+        )
+        (if (and (>= completed-count u100) (is-none (map-get? performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "expert-100",
+            })))
+            (map-set performance-milestones {
+                supplier-id: supplier-id,
+                milestone-type: "expert-100",
+            } {
+                count: completed-count,
+                achieved-at: stacks-block-height,
+            })
+            true
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-supplier-performance (supplier-id uint))
+    (map-get? supplier-performance { supplier-id: supplier-id })
+)
+
+(define-read-only (get-performance-milestone
+        (supplier-id uint)
+        (milestone-type (string-ascii 16))
+    )
+    (map-get? performance-milestones {
+        supplier-id: supplier-id,
+        milestone-type: milestone-type,
+    })
+)
+
+(define-read-only (get-supplier-performance-summary (supplier-id uint))
+    (match (get-supplier-performance supplier-id)
+        performance-data (some {
+            supplier-id: supplier-id,
+            performance-score: (get performance-score performance-data),
+            completion-rate: (if (> (get total-transactions performance-data) u0)
+                (/ (* (get completed-transactions performance-data) u10000)
+                    (get total-transactions performance-data)
+                )
+                u0
+            ),
+            dispute-rate: (if (> (get total-transactions performance-data) u0)
+                (/ (* (get disputed-transactions performance-data) u10000)
+                    (get total-transactions performance-data)
+                )
+                u0
+            ),
+            total-transactions: (get total-transactions performance-data),
+            total-value: (get total-transaction-value performance-data),
+            average-completion-time: (get average-completion-time performance-data),
+        })
+        none
+    )
+)
+
+(define-read-only (calculate-performance-tier (supplier-id uint))
+    (match (get-supplier-performance supplier-id)
+        performance-data (let (
+                (score (get performance-score performance-data))
+                (completed-count (get completed-transactions performance-data))
+            )
+            (if (and (>= score u9000) (>= completed-count u100))
+                "platinum"
+                (if (and (>= score u8000) (>= completed-count u50))
+                    "gold"
+                    (if (and (>= score u7000) (>= completed-count u10))
+                        "silver"
+                        "bronze"
+                    )
+                )
+            )
+        )
+        "unrated"
+    )
+)
+
+(define-read-only (get-performance-recommendations (supplier-id uint))
+    (match (get-supplier-performance supplier-id)
+        performance-data (let (
+                (completion-rate (if (> (get total-transactions performance-data) u0)
+                    (/ (* (get completed-transactions performance-data) u10000)
+                        (get total-transactions performance-data)
+                    )
+                    u0
+                ))
+                (dispute-rate (if (> (get total-transactions performance-data) u0)
+                    (/ (* (get disputed-transactions performance-data) u10000)
+                        (get total-transactions performance-data)
+                    )
+                    u0
+                ))
+                (avg-time (get average-completion-time performance-data))
+            )
+            (some {
+                risk-level: (if (<= completion-rate u7000)
+                    "high"
+                    (if (<= completion-rate u8500)
+                        "medium"
+                        "low"
+                    )
+                ),
+                recommended-for-high-value: (and (>= completion-rate u8500) (<= dispute-rate u200)),
+                trust-score: (get performance-score performance-data),
+                delivery-reliability: (if (> avg-time u288)
+                    "slow"
+                    (if (> avg-time u144)
+                        "average"
+                        "fast"
+                    )
+                ),
+            })
+        )
+        none
+    )
+)
+
+(define-read-only (compare-supplier-performance
+        (supplier-id-1 uint)
+        (supplier-id-2 uint)
+    )
+    (let (
+            (perf-1 (get-supplier-performance supplier-id-1))
+            (perf-2 (get-supplier-performance supplier-id-2))
+        )
+        (match perf-1
+            data-1 (match perf-2
+                data-2 (some {
+                    supplier-1-score: (get performance-score data-1),
+                    supplier-2-score: (get performance-score data-2),
+                    better-performer: (if (> (get performance-score data-1)
+                            (get performance-score data-2)
+                        )
+                        supplier-id-1
+                        supplier-id-2
+                    ),
+                    score-difference: (if (> (get performance-score data-1)
+                            (get performance-score data-2)
+                        )
+                        (- (get performance-score data-1)
+                            (get performance-score data-2)
+                        )
+                        (- (get performance-score data-2)
+                            (get performance-score data-1)
+                        )
+                    ),
+                })
+                none
+            )
+            none
+        )
+    )
 )
