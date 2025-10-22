@@ -12,6 +12,7 @@
 (define-data-var next-supplier-id uint u1)
 (define-data-var platform-fee uint u50)
 (define-data-var min-stake uint u1000000)
+(define-data-var next-referral-id uint u1)
 
 (define-map suppliers
     { supplier-id: uint }
@@ -100,17 +101,44 @@
     }
 )
 
+(define-map referrals
+    { referral-id: uint }
+    {
+        referrer-id: uint,
+        referred-id: uint,
+        reward-claimed: bool,
+        referred-transactions: uint,
+        reward-earned: uint,
+        created-at: uint,
+        qualified-at: (optional uint),
+    }
+)
+
+(define-map supplier-referrals
+    { referrer-id: uint }
+    {
+        total-referrals: uint,
+        qualified-referrals: uint,
+        total-rewards: uint,
+        last-referral: uint,
+    }
+)
+
 (define-constant VERIFIED-BADGE "verified")
 (define-constant HIGH-VOLUME-BADGE "high-volume")
 (define-constant QUALITY-EXPERT-BADGE "quality-expert")
 (define-constant SPEED-DEMON-BADGE "speed-demon")
 (define-constant DISPUTE-FREE-BADGE "dispute-free")
 (define-constant CONSISTENCY-CHAMPION-BADGE "consistency-champion")
+(define-constant REFERRER-BADGE "referrer")
 
 (define-constant MIN-HIGH-VOLUME-TRANSACTIONS u50)
 (define-constant MIN-QUALITY-EXPERT-RATING u450)
 (define-constant MAX-SPEED-DEMON-TIME u100)
 (define-constant MIN-CONSISTENCY-RATE u9500)
+(define-constant MIN-REFERRALS-FOR-BADGE u3)
+(define-constant REFERRAL-REWARD u250000)
+(define-constant MIN-REFERRAL-TRANSACTIONS u5)
 
 (define-private (check-verified-badge (supplier-id uint))
     (match (map-get? supplier-performance { supplier-id: supplier-id })
@@ -158,6 +186,13 @@
                 false
             )
         )
+        false
+    )
+)
+
+(define-private (check-referrer-badge (supplier-id uint))
+    (match (map-get? supplier-referrals { referrer-id: supplier-id })
+        referral-data (>= (get qualified-referrals referral-data) MIN-REFERRALS-FOR-BADGE)
         false
     )
 )
@@ -210,6 +245,10 @@
         )
         (if (check-consistency-champion-badge supplier-id)
             (unwrap-panic (award-badge supplier-id CONSISTENCY-CHAMPION-BADGE))
+            true
+        )
+        (if (check-referrer-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id REFERRER-BADGE))
             true
         )
         (ok true)
@@ -295,6 +334,73 @@
         (map-set supplier-by-principal { owner: tx-sender } { supplier-id: supplier-id })
 
         (var-set next-supplier-id (+ supplier-id u1))
+        (ok supplier-id)
+    )
+)
+
+(define-public (register-supplier-with-referral
+        (name (string-ascii 64))
+        (category (string-ascii 32))
+        (referrer-id uint)
+    )
+    (let (
+            (supplier-id (var-get next-supplier-id))
+            (stake (var-get min-stake))
+            (referral-id (var-get next-referral-id))
+        )
+        (asserts! (>= (stx-get-balance tx-sender) stake) ERR_INSUFFICIENT_FUNDS)
+        (asserts! (is-none (map-get? supplier-by-principal { owner: tx-sender }))
+            ERR_SUPPLIER_EXISTS
+        )
+        (asserts! (> (len name) u0) ERR_INVALID_PARAMETERS)
+        (asserts! (> (len category) u0) ERR_INVALID_PARAMETERS)
+        (asserts! (is-some (get-supplier referrer-id)) ERR_SUPPLIER_NOT_FOUND)
+        (asserts! (is-supplier-active referrer-id) ERR_SUPPLIER_NOT_FOUND)
+
+        (try! (stx-transfer? stake tx-sender (as-contract tx-sender)))
+
+        (map-set suppliers { supplier-id: supplier-id } {
+            owner: tx-sender,
+            name: name,
+            category: category,
+            total-rating: u0,
+            rating-count: u0,
+            average-rating: u0,
+            stake-amount: stake,
+            created-at: stacks-block-height,
+            is-active: true,
+        })
+
+        (map-set supplier-by-principal { owner: tx-sender } { supplier-id: supplier-id })
+
+        (map-set referrals { referral-id: referral-id } {
+            referrer-id: referrer-id,
+            referred-id: supplier-id,
+            reward-claimed: false,
+            referred-transactions: u0,
+            reward-earned: u0,
+            created-at: stacks-block-height,
+            qualified-at: none,
+        })
+
+        (let ((current-referrals (default-to {
+                total-referrals: u0,
+                qualified-referrals: u0,
+                total-rewards: u0,
+                last-referral: u0,
+            }
+                (map-get? supplier-referrals { referrer-id: referrer-id })
+            )))
+            (map-set supplier-referrals { referrer-id: referrer-id } {
+                total-referrals: (+ (get total-referrals current-referrals) u1),
+                qualified-referrals: (get qualified-referrals current-referrals),
+                total-rewards: (get total-rewards current-referrals),
+                last-referral: referral-id,
+            })
+        )
+
+        (var-set next-supplier-id (+ supplier-id u1))
+        (var-set next-referral-id (+ referral-id u1))
         (ok supplier-id)
     )
 )
@@ -411,6 +517,7 @@
             ))
             (unwrap-panic (check-performance-milestones (get supplier-id transaction-data)))
             (unwrap-panic (check-and-award-all-badges (get supplier-id transaction-data)))
+            (unwrap-panic (update-referral-progress (get supplier-id transaction-data)))
         )
 
         (map-delete escrow-funds { transaction-id: transaction-id })
@@ -1036,4 +1143,130 @@
         supplier-id: supplier-id,
         badge-type: badge-type,
     })
+)
+
+(define-private (update-referral-progress (referred-supplier-id uint))
+    (match (get-referral-by-referred referred-supplier-id)
+        referral-data (let (
+                (referral-id (get referral-id referral-data))
+                (new-transaction-count (+ (get referred-transactions referral-data) u1))
+                (is-now-qualified (>= new-transaction-count MIN-REFERRAL-TRANSACTIONS))
+                (was-qualified (is-some (get qualified-at referral-data)))
+            )
+            (map-set referrals { referral-id: referral-id } {
+                referrer-id: (get referrer-id referral-data),
+                referred-id: referred-supplier-id,
+                reward-claimed: (get reward-claimed referral-data),
+                referred-transactions: new-transaction-count,
+                reward-earned: (if is-now-qualified
+                    REFERRAL-REWARD
+                    u0
+                ),
+                created-at: (get created-at referral-data),
+                qualified-at: (if (and is-now-qualified (not was-qualified))
+                    (some stacks-block-height)
+                    (get qualified-at referral-data)
+                ),
+            })
+            (if (and is-now-qualified (not was-qualified))
+                (let ((current-referrals (unwrap-panic (map-get? supplier-referrals { referrer-id: (get referrer-id referral-data) }))))
+                    (map-set supplier-referrals { referrer-id: (get referrer-id referral-data) } {
+                        total-referrals: (get total-referrals current-referrals),
+                        qualified-referrals: (+ (get qualified-referrals current-referrals) u1),
+                        total-rewards: (+ (get total-rewards current-referrals) REFERRAL-REWARD),
+                        last-referral: (get last-referral current-referrals),
+                    })
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-referral-reward (referral-id uint))
+    (let (
+            (referral-data (unwrap! (map-get? referrals { referral-id: referral-id })
+                ERR_SUPPLIER_NOT_FOUND
+            ))
+            (referrer-data (unwrap! (get-supplier (get referrer-id referral-data))
+                ERR_SUPPLIER_NOT_FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get owner referrer-data)) ERR_UNAUTHORIZED)
+        (asserts! (not (get reward-claimed referral-data)) ERR_ALREADY_RATED)
+        (asserts! (is-some (get qualified-at referral-data))
+            ERR_BADGE_NOT_QUALIFIED
+        )
+        (asserts! (> (get reward-earned referral-data) u0) ERR_INVALID_PARAMETERS)
+
+        (try! (as-contract (stx-transfer? (get reward-earned referral-data) tx-sender
+            (get owner referrer-data)
+        )))
+
+        (map-set referrals { referral-id: referral-id }
+            (merge referral-data { reward-claimed: true })
+        )
+
+        (ok (get reward-earned referral-data))
+    )
+)
+
+(define-read-only (get-referral (referral-id uint))
+    (map-get? referrals { referral-id: referral-id })
+)
+
+(define-read-only (get-supplier-referral-stats (referrer-id uint))
+    (map-get? supplier-referrals { referrer-id: referrer-id })
+)
+
+(define-private (get-referral-by-referred (referred-supplier-id uint))
+    (let ((search-result (fold check-referral-match (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) none)))
+        search-result
+    )
+)
+
+(define-private (check-referral-match
+        (referral-id uint)
+        (current-match (optional {
+            referral-id: uint,
+            referrer-id: uint,
+            referred-id: uint,
+            reward-claimed: bool,
+            referred-transactions: uint,
+            reward-earned: uint,
+            created-at: uint,
+            qualified-at: (optional uint),
+        }))
+    )
+    (if (is-some current-match)
+        current-match
+        (match (map-get? referrals { referral-id: referral-id })
+            referral-data (if (is-eq (get referred-id referral-data) (var-get next-supplier-id))
+                (some (merge referral-data { referral-id: referral-id }))
+                none
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (get-referral-leaderboard)
+    (ok true)
+)
+
+(define-read-only (calculate-referral-bonus (referrer-id uint))
+    (match (get-supplier-referral-stats referrer-id)
+        referral-data (let ((qualified-count (get qualified-referrals referral-data)))
+            (if (>= qualified-count u10)
+                (* REFERRAL-REWARD u15 (/ qualified-count u10))
+                (if (>= qualified-count u5)
+                    (* REFERRAL-REWARD u10)
+                    u0
+                )
+            )
+        )
+        u0
+    )
 )
