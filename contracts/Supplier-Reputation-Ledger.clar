@@ -6,6 +6,8 @@
 (define-constant ERR_INSUFFICIENT_FUNDS (err u104))
 (define-constant ERR_SUPPLIER_EXISTS (err u105))
 (define-constant ERR_INVALID_PARAMETERS (err u106))
+(define-constant ERR_BADGE_ALREADY_EARNED (err u107))
+(define-constant ERR_BADGE_NOT_QUALIFIED (err u108))
 
 (define-data-var next-supplier-id uint u1)
 (define-data-var platform-fee uint u50)
@@ -85,6 +87,133 @@
 (define-map escrow-funds
     { transaction-id: uint }
     { amount: uint }
+)
+
+(define-map supplier-badges
+    {
+        supplier-id: uint,
+        badge-type: (string-ascii 20),
+    }
+    {
+        earned-at: uint,
+        active: bool,
+    }
+)
+
+(define-constant VERIFIED-BADGE "verified")
+(define-constant HIGH-VOLUME-BADGE "high-volume")
+(define-constant QUALITY-EXPERT-BADGE "quality-expert")
+(define-constant SPEED-DEMON-BADGE "speed-demon")
+(define-constant DISPUTE-FREE-BADGE "dispute-free")
+(define-constant CONSISTENCY-CHAMPION-BADGE "consistency-champion")
+
+(define-constant MIN-HIGH-VOLUME-TRANSACTIONS u50)
+(define-constant MIN-QUALITY-EXPERT-RATING u450)
+(define-constant MAX-SPEED-DEMON-TIME u100)
+(define-constant MIN-CONSISTENCY-RATE u9500)
+
+(define-private (check-verified-badge (supplier-id uint))
+    (match (map-get? supplier-performance { supplier-id: supplier-id })
+        perf-data (>= (get completed-transactions perf-data) u1)
+        false
+    )
+)
+
+(define-private (check-high-volume-badge (supplier-id uint))
+    (match (map-get? supplier-performance { supplier-id: supplier-id })
+        perf-data (>= (get total-transactions perf-data) MIN-HIGH-VOLUME-TRANSACTIONS)
+        false
+    )
+)
+
+(define-private (check-quality-expert-badge (supplier-id uint))
+    (match (get-supplier supplier-id)
+        supplier-data (>= (get average-rating supplier-data) MIN-QUALITY-EXPERT-RATING)
+        false
+    )
+)
+
+(define-private (check-speed-demon-badge (supplier-id uint))
+    (match (map-get? supplier-performance { supplier-id: supplier-id })
+        perf-data (and (> (get average-completion-time perf-data) u0) (<= (get average-completion-time perf-data) MAX-SPEED-DEMON-TIME))
+        false
+    )
+)
+
+(define-private (check-dispute-free-badge (supplier-id uint))
+    (match (map-get? supplier-performance { supplier-id: supplier-id })
+        perf-data (is-eq (get disputed-transactions perf-data) u0)
+        false
+    )
+)
+
+(define-private (check-consistency-champion-badge (supplier-id uint))
+    (match (map-get? supplier-performance { supplier-id: supplier-id })
+        perf-data (let (
+                (total (get total-transactions perf-data))
+                (completed (get completed-transactions perf-data))
+            )
+            (if (> total u0)
+                (>= (/ (* completed u10000) total) MIN-CONSISTENCY-RATE)
+                false
+            )
+        )
+        false
+    )
+)
+
+(define-private (award-badge
+        (supplier-id uint)
+        (badge-type (string-ascii 20))
+    )
+    (let ((badge-exists (map-get? supplier-badges {
+            supplier-id: supplier-id,
+            badge-type: badge-type,
+        })))
+        (if (is-none badge-exists)
+            (begin
+                (map-set supplier-badges {
+                    supplier-id: supplier-id,
+                    badge-type: badge-type,
+                } {
+                    earned-at: stacks-block-height,
+                    active: true,
+                })
+                (ok true)
+            )
+            ERR_BADGE_ALREADY_EARNED
+        )
+    )
+)
+
+(define-private (check-and-award-all-badges (supplier-id uint))
+    (begin
+        (if (check-verified-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id VERIFIED-BADGE))
+            true
+        )
+        (if (check-high-volume-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id HIGH-VOLUME-BADGE))
+            true
+        )
+        (if (check-quality-expert-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id QUALITY-EXPERT-BADGE))
+            true
+        )
+        (if (check-speed-demon-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id SPEED-DEMON-BADGE))
+            true
+        )
+        (if (check-dispute-free-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id DISPUTE-FREE-BADGE))
+            true
+        )
+        (if (check-consistency-champion-badge supplier-id)
+            (unwrap-panic (award-badge supplier-id CONSISTENCY-CHAMPION-BADGE))
+            true
+        )
+        (ok true)
+    )
 )
 
 (define-read-only (get-supplier (supplier-id uint))
@@ -281,6 +410,7 @@
                 (get amount transaction-data) completion-time "completed"
             ))
             (unwrap-panic (check-performance-milestones (get supplier-id transaction-data)))
+            (unwrap-panic (check-and-award-all-badges (get supplier-id transaction-data)))
         )
 
         (map-delete escrow-funds { transaction-id: transaction-id })
@@ -828,4 +958,82 @@
             none
         )
     )
+)
+
+(define-public (claim-badge
+        (supplier-id uint)
+        (badge-type (string-ascii 20))
+    )
+    (let ((supplier-lookup (unwrap! (map-get? supplier-by-principal { owner: tx-sender })
+            ERR_SUPPLIER_NOT_FOUND
+        )))
+        (asserts! (is-eq supplier-id (get supplier-id supplier-lookup))
+            ERR_UNAUTHORIZED
+        )
+        (asserts!
+            (or
+                (is-eq badge-type VERIFIED-BADGE)
+                (or
+                    (is-eq badge-type HIGH-VOLUME-BADGE)
+                    (or
+                        (is-eq badge-type QUALITY-EXPERT-BADGE)
+                        (or
+                            (is-eq badge-type SPEED-DEMON-BADGE)
+                            (or
+                                (is-eq badge-type DISPUTE-FREE-BADGE)
+                                (is-eq badge-type CONSISTENCY-CHAMPION-BADGE)
+                            )
+                        )
+                    )
+                )
+            )
+            ERR_INVALID_PARAMETERS
+        )
+        (let ((qualifies (if (is-eq badge-type VERIFIED-BADGE)
+                (check-verified-badge supplier-id)
+                (if (is-eq badge-type HIGH-VOLUME-BADGE)
+                    (check-high-volume-badge supplier-id)
+                    (if (is-eq badge-type QUALITY-EXPERT-BADGE)
+                        (check-quality-expert-badge supplier-id)
+                        (if (is-eq badge-type SPEED-DEMON-BADGE)
+                            (check-speed-demon-badge supplier-id)
+                            (if (is-eq badge-type DISPUTE-FREE-BADGE)
+                                (check-dispute-free-badge supplier-id)
+                                (check-consistency-champion-badge supplier-id)
+                            )
+                        )
+                    )
+                )
+            )))
+            (asserts! qualifies ERR_BADGE_NOT_QUALIFIED)
+            (award-badge supplier-id badge-type)
+        )
+    )
+)
+
+(define-read-only (get-supplier-badges (supplier-id uint))
+    (map-get? supplier-badges {
+        supplier-id: supplier-id,
+        badge-type: VERIFIED-BADGE,
+    })
+)
+
+(define-read-only (has-badge
+        (supplier-id uint)
+        (badge-type (string-ascii 20))
+    )
+    (is-some (map-get? supplier-badges {
+        supplier-id: supplier-id,
+        badge-type: badge-type,
+    }))
+)
+
+(define-read-only (get-badge-details
+        (supplier-id uint)
+        (badge-type (string-ascii 20))
+    )
+    (map-get? supplier-badges {
+        supplier-id: supplier-id,
+        badge-type: badge-type,
+    })
 )
