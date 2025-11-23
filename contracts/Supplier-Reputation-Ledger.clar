@@ -1270,3 +1270,54 @@
         u0
     )
 )
+
+(define-read-only (get-supplier-dashboard (supplier-id uint))
+    (match (get-supplier supplier-id)
+        supplier-data (let (
+                (performance-summary-opt (get-supplier-performance-summary supplier-id))
+                (performance-summary (default-to {
+                    supplier-id: supplier-id,
+                    performance-score: u0,
+                    completion-rate: u0,
+                    dispute-rate: u0,
+                    total-transactions: u0,
+                    total-value: u0,
+                    average-completion-time: u0,
+                }
+                    performance-summary-opt
+                ))
+                (tier (calculate-performance-tier supplier-id))
+                (has-verified (has-badge supplier-id VERIFIED-BADGE))
+                (has-high-volume (has-badge supplier-id HIGH-VOLUME-BADGE))
+                (has-quality-expert (has-badge supplier-id QUALITY-EXPERT-BADGE))
+                (has-speed-demon (has-badge supplier-id SPEED-DEMON-BADGE))
+                (has-dispute-free (has-badge supplier-id DISPUTE-FREE-BADGE))
+                (has-consistency-champion (has-badge supplier-id CONSISTENCY-CHAMPION-BADGE))
+                (has-referrer (has-badge supplier-id REFERRER-BADGE))
+            )
+            (some {
+                supplier-id: supplier-id,
+                name: (get name supplier-data),
+                category: (get category supplier-data),
+                average-rating: (get average-rating supplier-data),
+                rating-count: (get rating-count supplier-data),
+                is-active: (get is-active supplier-data),
+                performance-score: (get performance-score performance-summary),
+                completion-rate: (get completion-rate performance-summary),
+                dispute-rate: (get dispute-rate performance-summary),
+                total-transactions: (get total-transactions performance-summary),
+                total-value: (get total-value performance-summary),
+                average-completion-time: (get average-completion-time performance-summary),
+                performance-tier: tier,
+                has-verified-badge: has-verified,
+                has-high-volume-badge: has-high-volume,
+                has-quality-expert-badge: has-quality-expert,
+                has-speed-demon-badge: has-speed-demon,
+                has-dispute-free-badge: has-dispute-free,
+                has-consistency-champion-badge: has-consistency-champion,
+                has-referrer-badge: has-referrer,
+            })
+        )
+        none
+    )
+)
